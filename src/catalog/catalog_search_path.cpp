@@ -2,6 +2,7 @@
 #include "duckdb/catalog/default/default_schemas.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/main/database_manager.hpp"
 
 #include "duckdb/common/exception/parser_exception.hpp"
+#include "duckdb/common/unordered_set.hpp"
 
 namespace duckdb {
 
@@ -249,9 +251,31 @@ vector<string> CatalogSearchPath::GetCatalogsForSchema(const string &schema) con
 	if (DefaultSchemaGenerator::IsDefaultSchema(schema)) {
 		catalogs.push_back(SYSTEM_CATALOG);
 	} else {
+		// Always check temp catalog first for shadowing support
+		// But not when schema is "temp" itself - that would cause ambiguity with the temp catalog name
+		if (!StringUtil::CIEquals(schema, TEMP_CATALOG)) {
+			catalogs.push_back(TEMP_CATALOG);
+		}
+		bool found_regular_catalog = false;
 		for (auto &path : paths) {
 			if (StringUtil::CIEquals(path.schema, schema)) {
-				catalogs.push_back(path.catalog);
+				// Don't add temp catalog again if it's already in the list
+				if (path.catalog != TEMP_CATALOG) {
+					catalogs.push_back(path.catalog);
+					found_regular_catalog = true;
+				}
+			}
+		}
+		// If no regular catalog was found for this schema, add the default database.
+		// This ensures explicitly-qualified schemas resolve correctly even when not
+		// in the search path. Previously this fallback was in GetCatalogEntries(),
+		// but since TEMP_CATALOG is now always added first, we must handle it here.
+		if (!found_regular_catalog) {
+			auto &default_entry = GetDefault();
+			if (!IsInvalidCatalog(default_entry.catalog)) {
+				catalogs.push_back(default_entry.catalog);
+			} else {
+				catalogs.push_back(DatabaseManager::GetDefaultDatabase(context));
 			}
 		}
 	}
@@ -278,11 +302,26 @@ void CatalogSearchPath::SetPathsInternal(vector<CatalogSearchEntry> new_paths) {
 	this->set_paths = std::move(new_paths);
 
 	paths.clear();
-	paths.reserve(set_paths.size() + 3);
-	paths.emplace_back(TEMP_CATALOG, DEFAULT_SCHEMA);
+	paths.reserve(set_paths.size() * 2 + 4);
+
+	// Track which schemas we've already added temp entries for to avoid duplicates
+	case_insensitive_set_t temp_schemas_added;
+
+	// For each user path, add temp version first (for shadowing), then the regular path
 	for (auto &path : set_paths) {
+		// Add temp version of this schema if not already added
+		if (temp_schemas_added.find(path.schema) == temp_schemas_added.end()) {
+			paths.emplace_back(TEMP_CATALOG, path.schema);
+			temp_schemas_added.insert(path.schema);
+		}
 		paths.push_back(path);
 	}
+
+	// Always add temp.main for default schema if not already added
+	if (temp_schemas_added.find(DEFAULT_SCHEMA) == temp_schemas_added.end()) {
+		paths.emplace_back(TEMP_CATALOG, DEFAULT_SCHEMA);
+	}
+
 	paths.emplace_back(INVALID_CATALOG, DEFAULT_SCHEMA);
 	paths.emplace_back(SYSTEM_CATALOG, DEFAULT_SCHEMA);
 	paths.emplace_back(SYSTEM_CATALOG, "pg_catalog");
