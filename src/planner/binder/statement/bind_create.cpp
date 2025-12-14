@@ -20,7 +20,9 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_secret_info.hpp"
+#include "duckdb/catalog/default/default_schemas.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
@@ -99,10 +101,15 @@ const string Binder::BindCatalog(string &catalog) {
 }
 
 void Binder::SearchSchema(CreateInfo &info) {
+	// Save original catalog to check if user explicitly specified a non-temp catalog
+	// This must be done BEFORE BindSchemaOrCatalog which may modify it
+	auto original_catalog = info.catalog;
+
+	// First, resolve catalog/schema using the standard logic
 	BindSchemaOrCatalog(info.catalog, info.schema);
-	if (IsInvalidCatalog(info.catalog) && info.temporary) {
-		info.catalog = TEMP_CATALOG;
-	}
+
+	// Resolve schema from search path BEFORE setting temporary catalog
+	// This ensures temporary objects respect the current search path
 	auto &search_path = ClientData::Get(context).catalog_search_path;
 	if (IsInvalidCatalog(info.catalog) && IsInvalidSchema(info.schema)) {
 		auto &default_entry = search_path->GetDefault();
@@ -116,20 +123,48 @@ void Binder::SearchSchema(CreateInfo &info) {
 	if (IsInvalidCatalog(info.catalog)) {
 		info.catalog = DatabaseManager::GetDefaultDatabase(context);
 	}
-	if (!info.temporary) {
+
+	if (info.temporary) {
+		// For temporary objects, redirect to temp catalog but preserve the resolved schema
+		// Only error if user EXPLICITLY specified a non-temp catalog (original_catalog was not empty)
+		if (!IsInvalidCatalog(original_catalog) && original_catalog != TEMP_CATALOG) {
+			// User explicitly specified a non-temp catalog for a temporary object
+			throw ParserException("TEMPORARY table names can *only* use the \"%s\" catalog", std::string(TEMP_CATALOG));
+		}
+		// Set catalog to temp
+		info.catalog = TEMP_CATALOG;
+	} else {
 		// non-temporary create: not read only
 		if (info.catalog == TEMP_CATALOG) {
 			throw ParserException("Only TEMPORARY table names can use the \"%s\" catalog", std::string(TEMP_CATALOG));
-		}
-	} else {
-		if (info.catalog != TEMP_CATALOG) {
-			throw ParserException("TEMPORARY table names can *only* use the \"%s\" catalog", std::string(TEMP_CATALOG));
 		}
 	}
 }
 
 SchemaCatalogEntry &Binder::BindSchema(CreateInfo &info) {
 	SearchSchema(info);
+
+	// For temporary objects, ensure the schema exists in the temp catalog
+	// If not, create it automatically
+	if (info.temporary && info.catalog == TEMP_CATALOG) {
+		// Block creation of temp objects in reserved/system schema names (information_schema, pg_catalog)
+		// This check must happen regardless of whether the schema already exists
+		if (DefaultSchemaGenerator::IsDefaultSchema(info.schema)) {
+			throw BinderException("Cannot create temporary schema with reserved name \"%s\"", info.schema);
+		}
+
+		auto &catalog = Catalog::GetCatalog(context, info.catalog);
+		auto existing_schema = catalog.GetSchema(context, info.schema, OnEntryNotFound::RETURN_NULL);
+		if (!existing_schema) {
+			// Create the schema in the temp catalog
+			CreateSchemaInfo schema_info;
+			schema_info.schema = info.schema;
+			schema_info.temporary = true;
+			schema_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+			catalog.CreateSchema(context, schema_info);
+		}
+	}
+
 	// fetch the schema in which we want to create the object
 	auto &schema_obj = Catalog::GetSchema(context, info.catalog, info.schema);
 	D_ASSERT(schema_obj.type == CatalogType::SCHEMA_ENTRY);
